@@ -6,6 +6,8 @@
 idf_component_register(
     SRCS
         "main.c"
+        "bt_app_core.c"
+        "bt_app_av.c"
     INCLUDE_DIRS
         "." "include"
 )

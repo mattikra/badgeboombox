@@ -19,7 +19,7 @@ build:
 	source "$(IDF_PATH)/export.sh" && idf.py build
 
 install: prepare build
-	python3 tools/webusb_push.py "Template App" build/main.bin --run
+	python3 tools/webusb_push.py "BadgeBoomBox" build/main.bin --run
 
 erase:
 	source "$(IDF_PATH)/export.sh" && idf.py erase-flash -p $(PORT)
