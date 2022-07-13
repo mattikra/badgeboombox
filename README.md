@@ -1,12 +1,10 @@
-# MCH2022 template app
+# MCH2022 badge boom box
 
-This repository contains a template app for the MCH2022 badge.
-It is intended to be used as the basis for developing your own native ESP32
-apps. See [Getting Started](https://badge.team/docs/badges/mch2022/software-development/esp_idf_getting_started/)
+This repository contains an example app MCH2022 badge. Bluetooth audio streaming. 
 
 ## License
 
-The source code contained in the main folder of this example is public domain / CC0 licensed, use it as you please.
+This repository is based on the mch2022 template app, https://github.com/badgeteam/mch2022-template-app, which is public domain / CC0 licensed.
 
 Source code included as submodules is licensed separately, please check the
 following table for details.
@@ -25,10 +23,4 @@ following table for details.
 | components/spi-ili9341      | MIT                               | Nicolai Electronics                                    |
 | components/ws2812           | Unlicense / Public domain         | None                                                   |
 
-## How to make
-```sh
-git clone --recursive https://github.com/badgeteam/mch2022-template-app
-cd mch2022-template-app
-make prepare
-make
-```
+This project contains snippets from the ESP-IDF bluetooth streaming example. See "esp-idf" in the table above.

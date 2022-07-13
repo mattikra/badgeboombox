@@ -26,6 +26,52 @@
 
 #include "sys/lock.h"
 
+static BTAudioState audioState = {
+  .connectionState = ESP_A2D_CONNECTION_STATE_DISCONNECTED,
+  .playState = ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND,
+  .volume = 100,
+  .sampleRate = 16000,
+  .title = {0},
+  .artist = {0},
+  .album = {0}
+};
+
+static _lock_t audioStateLock;
+static AudioStateChangeCB stateCB = NULL;
+
+inline static void lockAudioState() {
+  _lock_acquire(&audioStateLock);
+}
+
+inline static void unlockAudioState() {
+  _lock_release(&audioStateLock);
+}
+
+void getAudioState(BTAudioState *outState) {
+  if (outState) {
+    lockAudioState();
+    memcpy(outState, &audioState, sizeof(BTAudioState));
+    unlockAudioState();
+  }
+}
+
+uint8_t getVolume() {
+  lockAudioState();
+  uint8_t vol = audioState.volume;
+  unlockAudioState();
+  return vol;
+}
+
+void setAudioStateChangeCB(AudioStateChangeCB cb) {
+  stateCB = cb;
+}
+
+void notifyAudioStateChange() {
+  if (stateCB) {
+    stateCB();
+  }
+}
+
 /* AVRCP used transaction labels */
 #define APP_RC_CT_TL_GET_CAPS            (0)
 #define APP_RC_CT_TL_GET_META_DATA       (1)
@@ -49,10 +95,6 @@ static void bt_av_play_pos_changed(void);
 static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_parameter);
 /* set volume by remote controller */
 static void volume_set_by_controller(uint8_t volume);
-/* set volume by local host */
-static void volume_set_by_local_host(uint8_t volume);
-/* simulation volume change */
-static void volume_change_simulation(void *arg);
 /* a2dp event handler */
 static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param);
 /* avrc controller event handler */
@@ -73,9 +115,7 @@ static const char *s_a2d_audio_state_str[] = {"Suspended", "Stopped", "Started"}
                                              /* audio stream datapath state in string */
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
                                              /* AVRC target notification capability bit mask */
-static _lock_t s_volume_lock;
-static xTaskHandle s_vcs_task_hdl = NULL;    /* handle for volume change simulation task */
-static uint8_t s_volume = 0;                 /* local volume value */
+
 static bool s_volume_notify;                 /* notify volume change or not */
 
 /********************************
@@ -152,39 +192,26 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
 static void volume_set_by_controller(uint8_t volume)
 {
     ESP_LOGI(BT_RC_TG_TAG, "Volume is set by remote controller to: %d%%", (uint32_t)volume * 100 / 0x7f);
-    /* set the volume in protection of lock */
-    _lock_acquire(&s_volume_lock);
-    s_volume = volume;
-    _lock_release(&s_volume_lock);
+    lockAudioState();
+    audioState.volume = volume;
+    unlockAudioState();
+    notifyAudioStateChange();
 }
 
-static void volume_set_by_local_host(uint8_t volume)
+void volume_set_by_local_host(uint8_t volume)
 {
     ESP_LOGI(BT_RC_TG_TAG, "Volume is set locally to: %d%%", (uint32_t)volume * 100 / 0x7f);
-    /* set the volume in protection of lock */
-    _lock_acquire(&s_volume_lock);
-    s_volume = volume;
-    _lock_release(&s_volume_lock);
-
+    lockAudioState();
+    audioState.volume = volume;
+    unlockAudioState();
     /* send notification response to remote AVRCP controller */
     if (s_volume_notify) {
         esp_avrc_rn_param_t rn_param;
-        rn_param.volume = s_volume;
+        rn_param.volume = getVolume();
         esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn_param);
         s_volume_notify = false;
     }
-}
-
-static void volume_change_simulation(void *arg)
-{
-    ESP_LOGI(BT_RC_TG_TAG, "start volume change simulation");
-
-    for (;;) {
-        /* volume up locally every 10 seconds */
-        vTaskDelay(10000 / portTICK_RATE_MS);
-        uint8_t volume = (s_volume + 5) & 0x7f;
-        volume_set_by_local_host(volume);
-    }
+    notifyAudioStateChange();
 }
 
 static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
@@ -207,6 +234,16 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
             bt_i2s_task_start_up();
         }
+        lockAudioState();
+        audioState.connectionState = a2d->conn_stat.state;
+        if (audioState.connectionState != ESP_A2D_CONNECTION_STATE_CONNECTED) {
+          audioState.playState = ESP_A2D_AUDIO_STATE_STOPPED;
+          audioState.title[0] = 0;
+          audioState.artist[0] = 0;
+          audioState.album[0] = 0;
+        }
+        unlockAudioState();
+        notifyAudioStateChange();
         break;
     }
     /* when audio stream transmission state changed, this event comes */
@@ -217,6 +254,10 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
             s_pkt_cnt = 0;
         }
+        lockAudioState();
+        audioState.playState = a2d->audio_stat.state;
+        unlockAudioState();
+        notifyAudioStateChange();
         break;
     }
     /* when audio codec is configured, this event comes */
@@ -242,6 +283,10 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
                      a2d->audio_cfg.mcc.cie.sbc[2],
                      a2d->audio_cfg.mcc.cie.sbc[3]);
             ESP_LOGI(BT_AV_TAG, "Audio player configured, sample rate: %d", sample_rate);
+            lockAudioState(&audioStateLock);
+            audioState.sampleRate = sample_rate;
+            unlockAudioState(&audioStateLock);
+            notifyAudioStateChange();
         }
         break;
     }
@@ -290,6 +335,25 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
     /* when metadata responsed, this event comes */
     case ESP_AVRC_CT_METADATA_RSP_EVT: {
         ESP_LOGI(BT_RC_CT_TAG, "AVRC metadata rsp: attribute id 0x%x, %s", rc->meta_rsp.attr_id, rc->meta_rsp.attr_text);
+        if (rc->meta_rsp.attr_id == ESP_AVRC_MD_ATTR_TITLE) {
+          lockAudioState();
+          strncpy(audioState.title, (char*)(rc->meta_rsp.attr_text), AUDIOSTATE_STRLEN);
+          audioState.title[AUDIOSTATE_STRLEN-1] = 0;
+          unlockAudioState();
+          notifyAudioStateChange();
+        } else if (rc->meta_rsp.attr_id == ESP_AVRC_MD_ATTR_ARTIST) {
+          lockAudioState();
+          strncpy(audioState.artist, (char*)(rc->meta_rsp.attr_text), AUDIOSTATE_STRLEN);
+          audioState.artist[AUDIOSTATE_STRLEN-1] = 0;
+          unlockAudioState();
+          notifyAudioStateChange();
+        } else if (rc->meta_rsp.attr_id == ESP_AVRC_MD_ATTR_ALBUM) {
+          lockAudioState();
+          strncpy(audioState.album, (char*)(rc->meta_rsp.attr_text), AUDIOSTATE_STRLEN);
+          audioState.album[AUDIOSTATE_STRLEN-1] = 0;
+          unlockAudioState();
+          notifyAudioStateChange();
+        }
         free(rc->meta_rsp.attr_text);
         break;
     }
@@ -333,13 +397,6 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
         uint8_t *bda = rc->conn_stat.remote_bda;
         ESP_LOGI(BT_RC_TG_TAG, "AVRC conn_state evt: state %d, [%02x:%02x:%02x:%02x:%02x:%02x]",
                  rc->conn_stat.connected, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-        if (rc->conn_stat.connected) {
-            /* create task to simulate volume change */
-            xTaskCreate(volume_change_simulation, "vcsTask", 2048, NULL, 5, &s_vcs_task_hdl);
-        } else {
-            vTaskDelete(s_vcs_task_hdl);
-            ESP_LOGI(BT_RC_TG_TAG, "Stop volume change simulation");
-        }
         break;
     }
     /* when passthrough commanded, this event comes */
@@ -359,7 +416,9 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
         if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
             s_volume_notify = true;
             esp_avrc_rn_param_t rn_param;
-            rn_param.volume = s_volume;
+            lockAudioState();
+            rn_param.volume = audioState.volume;
+            unlockAudioState();
             esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_INTERIM, &rn_param);
         }
         break;

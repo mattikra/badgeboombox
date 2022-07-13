@@ -6,17 +6,64 @@
  */
 
 #include "main.h"
+#include "bt_app_av.h"
+#include "bt_app_core.h"
 
-static pax_buf_t buf;
-xQueueHandle buttonQueue;
+#define DBMETER_HEIGHT 5
+#define DBMETER_MAX 70
+#define DBMETER_MIN 20
 
-void bt_main(void);
+/** events types that may come from the audio stack */
+typedef enum BTAudioEventType_ {
+  Event_StateChanged = 1, ///< audio state has changed, may be queried using getAudioState
+  Event_RMSUpdate        ///< audio RMS update
+} BTAudioEventType;
 
-static const char *TAG = "mch2022-demo-app";
+/** an audio event struct */
+typedef struct BTAudioEvent_ {
+  BTAudioEventType type;
+  union {
+    struct {
+      float left;
+      float right;
+    } rms;
+  } data;
+} BTAudioEvent;
 
-// Updates the screen with the last drawing.
-void disp_flush() {
-    ili9341_write(get_ili9341(), buf.buf);
+void bt_init(void);
+void drawAll();
+void drawDBMeter();
+
+static pax_buf_t screenBuf;
+static xQueueHandle buttonQueue;
+static xQueueHandle audioQueue;
+static float leftDBMeter = 0;
+static float rightDBMeter = 0;
+static BTAudioState audioState = {
+  .connectionState = ESP_A2D_CONNECTION_STATE_DISCONNECTED,
+  .playState = ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND,
+  .volume = 100,
+  .sampleRate = 16000,
+  .title = {0},
+  .artist = {0},
+  .album = {0}
+};
+
+/** callback from bt_app_av: state has changed */
+void audioStateChange() {
+  BTAudioEvent evt = {
+    .type = Event_StateChanged
+  };
+  xQueueSend(audioQueue, &evt, 0);  //evt is copied to queue
+}
+
+/** callback from bt_app_core: new volume measurement */
+void audioRMSUpdate(float left, float right) {
+  BTAudioEvent evt;
+  evt.type = Event_RMSUpdate;
+  evt.data.rms.left = left;
+  evt.data.rms.right = right;
+  xQueueSend(audioQueue, &evt, 0); //evt is copied to queue
 }
 
 // Exits the app, returning to the launcher.
@@ -34,56 +81,130 @@ void app_main() {
     buttonQueue = get_rp2040()->queue;
     
     // Init graphics for the screen.
-    pax_buf_init(&buf, NULL, 320, 240, PAX_BUF_16_565RGB);
+    pax_buf_init(&screenBuf, NULL, 320, 240, PAX_BUF_16_565RGB);
     
     // Init NVS.
     nvs_flash_init();
     
-    // Init (but not connect to) WiFi.
-    bt_main();
+    //show something
+    drawAll();
+
+    // start Bluetooth
+    setAudioStateChangeCB(&audioStateChange);
+    setAudioRmsCB(&audioRMSUpdate);
+    bt_init();
     
-    while (1) {
-        // Pick a random background color.
-        int hue = esp_random() & 255;
-        pax_col_t col = pax_col_hsv(hue, 255 /*saturation*/, 255 /*brighness*/);
-        
-        // Show some random color hello world.
-        // Draw the background with aforementioned random color.
-        pax_background(&buf, col);
-        // This text is shown on screen.
-        char             *text = "Hello, World!";
-        // Pick the font to draw in (this is the only one that looks nice this big).
-        const pax_font_t *font = pax_font_saira_condensed;
-        // Determine how large the text is so it can be centered.
-        pax_vec1_t        dims = pax_text_size(font, font->default_size, text);
-        // Use info to draw the centered text.
-        pax_draw_text(
-            // Buffer to draw to.
-            &buf, 0xff000000,
-            // Font and size to use.
-            font, font->default_size,
-            // Position (top left corner) of the app.
-            (buf.width  - dims.x) / 2.0,
-            (buf.height - dims.y) / 2.0,
-            // The text to be shown.
-            text
-        );
-        // Draws the entire graphics buffer to the screen.
-        disp_flush();
-        
-        // Await any button press and do another cycle.
-        // Structure used to receive data.
-        rp2040_input_message_t message;
-        // Await forever (because of portMAX_DELAY), a button press.
-        xQueueReceive(buttonQueue, &message, portMAX_DELAY);
-        
-        // Is the home button currently pressed?
-        if (message.input == RP2040_INPUT_BUTTON_HOME && message.state) {
-            // If home is pressed, exit to launcher.
+  // this queue receives events from the audio stack
+  audioQueue = xQueueCreate( 10, sizeof(BTAudioEvent) );
+
+
+  //generate queue set for button and audio events
+  QueueSetHandle_t queueSet = xQueueCreateSet(20);
+  xQueueAddToSet(buttonQueue, queueSet);
+  xQueueAddToSet(audioQueue, queueSet);
+
+  while (1) { //handle events from both button and audio queue
+    QueueSetMemberHandle_t queue = xQueueSelectFromSet(queueSet, portMAX_DELAY);
+    if (queue == buttonQueue) {
+      rp2040_input_message_t message;
+      xQueueReceive(buttonQueue, &message, 0);
+      if (message.state) {
+        switch(message.input) {
+          case RP2040_INPUT_BUTTON_HOME:
             exit_to_launcher();
+            break;
+          case RP2040_INPUT_JOYSTICK_UP:
+            volume_set_by_local_host(audioState.volume < 122 ? (audioState.volume+5) : 127);
+            drawAll();
+            break;
+          case RP2040_INPUT_JOYSTICK_DOWN:
+            volume_set_by_local_host(audioState.volume > 5 ? (audioState.volume-5) : 0);
+            drawAll();
+            break;
+
         }
+      }
+    } else if (queue == audioQueue) { //audio event
+      BTAudioEvent evt;
+      xQueueReceive(audioQueue, &evt, 0);
+      if (evt.type == Event_StateChanged) { //state changed: update main UI
+        getAudioState(&audioState);
+        drawAll();
+      } else if (evt.type == Event_RMSUpdate) {  //RMS: Update bars
+        float leftDB = 20 * log10(evt.data.rms.left);
+        float rightDB = 20 * log10(evt.data.rms.right);
+        leftDBMeter = (leftDB - DBMETER_MIN) / (DBMETER_MAX - DBMETER_MIN);
+        rightDBMeter = (rightDB - DBMETER_MIN) / (DBMETER_MAX - DBMETER_MIN);
+        drawDBMeter();
+      }
     }
+  }
+
 }
+
+
+void drawAll() {
+  static const char disconnected[] = "Disconnected";
+  static const char connecting[] = "Connecting...";
+  static const char disconnecting[] = "Disconnecting...";
+  static const char stopped[] = "Stopped";
+  static const char playing[] = "Playing";
+  
+  pax_col_t bgCol = pax_col_rgb(0,0,0);
+  pax_background(&screenBuf, bgCol);
+
+  pax_col_t fontColor = pax_col_rgb(255,255,255);
+  const char *status = "?";
+  switch (audioState.connectionState) {
+    case ESP_A2D_CONNECTION_STATE_CONNECTING:
+      status = connecting;
+      break;
+    case ESP_A2D_CONNECTION_STATE_DISCONNECTING:
+      status = disconnecting;
+      break;
+    case ESP_A2D_CONNECTION_STATE_DISCONNECTED:
+      status = disconnected;
+      break;
+    case ESP_A2D_CONNECTION_STATE_CONNECTED:
+      status = (audioState.playState == ESP_A2D_AUDIO_STATE_STARTED) ? playing : stopped;
+  }
+
+  char volStr[30];
+  snprintf(volStr, 30, "Volume: %i%%",audioState.volume * 100 / 127);
+
+  pax_draw_text(&screenBuf, fontColor, pax_font_saira_condensed, pax_font_saira_condensed->default_size, 10, 10, status);
+  pax_draw_text(&screenBuf, fontColor, pax_font_saira_regular, pax_font_saira_regular->default_size, 10, 90, audioState.title);
+  pax_draw_text(&screenBuf, fontColor, pax_font_saira_regular, pax_font_saira_regular->default_size, 10, 115, audioState.artist);
+  pax_draw_text(&screenBuf, fontColor, pax_font_saira_regular, pax_font_saira_regular->default_size, 10, 140, audioState.album);
+  pax_draw_text(&screenBuf, fontColor, pax_font_saira_regular, pax_font_saira_regular->default_size, 10, 165, volStr);
+
+  ili9341_write_partial_direct(get_ili9341(), screenBuf.buf, 0, 0, ILI9341_WIDTH, ILI9341_HEIGHT-DBMETER_HEIGHT);
+  drawDBMeter();
+}
+
+void drawDBMeter() {
+  if ((audioState.connectionState != ESP_A2D_CONNECTION_STATE_CONNECTED) || (audioState.playState != ESP_A2D_AUDIO_STATE_STARTED)) {
+    leftDBMeter = 0;
+    rightDBMeter = 0;
+  }
+  int halfWidth = (ILI9341_WIDTH / 2);
+  float l = (leftDBMeter < 0) ? 0 : (leftDBMeter > 1) ? 1 : leftDBMeter;
+  float r = (rightDBMeter < 0) ? 0 : (rightDBMeter > 1) ? 1 : rightDBMeter;
+  int leftPix = halfWidth * l;
+  int rightPix = halfWidth * r;
+  int p1 = halfWidth - leftPix;
+  int p2 = halfWidth + rightPix;
+  int y = ILI9341_HEIGHT-DBMETER_HEIGHT;
+  pax_col_t bgCol = pax_col_rgb(0,0,0);
+  pax_col_t fgCol = pax_col_rgb(255,255,255);
+  pax_simple_rect(&screenBuf, bgCol, 0,  y, p1, DBMETER_HEIGHT);
+  pax_simple_rect(&screenBuf, fgCol, p1, y, p2-p1, DBMETER_HEIGHT);
+  pax_simple_rect(&screenBuf, bgCol, p2, y, ILI9341_WIDTH-p2, DBMETER_HEIGHT);
+  int off = 2 * ILI9341_WIDTH * (ILI9341_HEIGHT-DBMETER_HEIGHT);
+  ili9341_write_partial_direct(get_ili9341(), screenBuf.buf+off, 0, ILI9341_HEIGHT-DBMETER_HEIGHT, ILI9341_WIDTH, DBMETER_HEIGHT);
+}
+
+
 
 // ----------------------
 
@@ -123,7 +244,7 @@ void app_main() {
 #include "driver/i2s.h"
 
 /* device name */
-#define LOCAL_DEVICE_NAME    "ESP_SPEAKER"
+#define LOCAL_DEVICE_NAME "BadgeBoomBox"
 
 /* event for stack up */
 enum {
@@ -223,7 +344,7 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
  * MAIN ENTRY POINT
  ******************************/
 
-void bt_main(void)
+void bt_init(void)
 {
   esp_err_t err = ESP_OK;
 

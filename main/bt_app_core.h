@@ -13,6 +13,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+/** callback when audio RMS changes */
+typedef void (*AudioRmsCB)(float left, float right);
+
+/** set the callback to be called when the audio RMS changes 
+ * @param cb callback to set */
+void setAudioRmsCB(AudioRmsCB cb);
+
 /* log tag */
 #define BT_APP_CORE_TAG    "BT_APP_CORE"
 
